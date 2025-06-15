@@ -4,7 +4,7 @@ from spectral_gpt.layers.dsn_embedding import DSNEmbedding
 from spectral_gpt.block import SpectralBlock
 
 class QuectoCore(nn.Module):
-    def __init__(self, d_model: int = 32, n_heads: int = 4, depth: int = 2, Ω: int = 8):
+    def __init__(self, d_model: int = 64, n_heads: int = 4, depth: int = 4, Ω: int = 32):
         super().__init__()
         self.embed = DSNEmbedding(max_depth=Ω)
         self.proj  = nn.Linear(Ω, d_model)

@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: spectral-gpt-alpha
+Version: 0.1.0
+Summary: Prototype Spectral GPT Quecto
+Author: Lev
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE.txt
+Requires-Dist: torch
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Dynamic: license-file
+
+# sgpt-alpha
+SGPT Prototype 
