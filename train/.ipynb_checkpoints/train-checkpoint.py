@@ -1,75 +1,33 @@
 # -------------------------------------------------------------
 # Spectral-GPT training script
-# • optional entropy-band sampling
-# • optional rotary φ-phase, dynamic depth
-# • validation loop, best-ckpt, early-stop
+#  • Adaptive-Entropy curriculum        (optional)
+#  • Rotary φ-phase & dynamic depth     (optional)
+#  • Validation / early-stop / best-ckpt
+#  • Exponential-Moving-Average (EMA)   (optional, delayed start)
+#  • Cosine LR annealing                (optional)
+#  • Per-band validation loaders        (fixed index filtering)
 # -------------------------------------------------------------
 import argparse
+import itertools
 import math
 import time
 import pathlib
-from typing import Tuple, Optional
+from copy import deepcopy
+from typing import Optional
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, SubsetRandomSampler
 
-# ───────────────────────── dataset classes ─────────────────────────
-class ByteDataset(Dataset):
-    """
-    Infinite sampler of random byte windows from a raw .bin file.
-    """
-    def __init__(self, path: str, seq_len: int):
-        raw = pathlib.Path(path).read_bytes()
-        self.data = torch.tensor(list(raw), dtype=torch.long)
-        self.seq_len = seq_len
+from spectral_gpt.datasets.adaptive_entropy import AdaptiveEntropySampler
+from spectral_gpt.datasets.entropy_index import load_entropy_index
+from spectral_gpt.utils.ema import EMA
 
-    def __len__(self):
-        return 10_000_000  # virtual size
-
-    def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor]:
-        start = torch.randint(
-            0, len(self.data) - self.seq_len - 1, ()
-        ).item()
-        x = self.data[start : start + self.seq_len]
-        y = self.data[start + 1 : start + 1 + self.seq_len]
-        return x, y
-
-
-# Sequential dataset for deterministic validation
-class SeqByteDataset(Dataset):
-    """
-    Deterministic, non-shuffled windows for validation.
-    """
-    def __init__(self, path: str, seq_len: int):
-        raw = pathlib.Path(path).read_bytes()
-        self.data = torch.tensor(list(raw), dtype=torch.long)
-        self.seq_len = seq_len
-
-    def __len__(self):
-        return max(1, (len(self.data) - 1) // self.seq_len)
-
-    def __getitem__(self, idx):
-        start = idx * self.seq_len
-        x = self.data[start : start + self.seq_len]
-        y = self.data[start + 1 : start + 1 + self.seq_len]
-        return x, y
-
-
-# Optional entropy-banded dataset
-try:
-    from train.dataset import EntropyBandedDataset   # noqa: F401
-except ImportError:
-    EntropyBandedDataset = None  # type: ignore
-
-
-# ───────────────────────── helpers ─────────────────────────────
+# ───────────────────────── helpers ─────────────────────────
 LN2 = math.log(2.0)
-
 
 def bpb(loss_nats: torch.Tensor) -> float:
     return float(loss_nats) / LN2
-
 
 def select_device() -> torch.device:
     if torch.backends.mps.is_available():
@@ -81,114 +39,156 @@ def select_device() -> torch.device:
     print("⚙️  Using CPU")
     return torch.device("cpu")
 
+def save_ckpt(model: nn.Module, step: int, tag: str = ""):
+    out = pathlib.Path("chkpts"); out.mkdir(exist_ok=True)
+    name = f"sgpt_step{step}.pt" if tag == "" else f"{tag}.pt"
+    torch.save(model.state_dict(), out / name)
+    print(f"💾  checkpoint → {out/name}")
 
-def save_ckpt(model: nn.Module, step: int, out_dir: pathlib.Path, tag: str = ""):
-    out_dir.mkdir(exist_ok=True)
-    name = f"sgpt_step{step}.pt" if not tag else f"{tag}.pt"
-    path = out_dir / name
-    torch.save(model.state_dict(), path)
-    print(f"💾  checkpoint → {path}")
-
-
-# ───────────────────────── validation routine ─────────────────────────
 @torch.no_grad()
-def run_validation(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    max_batches: int,
-) -> float:
+def eval_bpb(model: nn.Module,
+             loader: DataLoader,
+             device: torch.device,
+             max_batches: int) -> float:
     model.eval()
-    nats_sum, tok_count = 0.0, 0
-    for i, (vx, vy) in enumerate(loader):
+    nats_sum, tok_sum = 0.0, 0
+    for i, (x, y) in enumerate(loader):
         if i >= max_batches:
             break
-        vx, vy = vx.to(device, non_blocking=True), vy.to(device, non_blocking=True)
-        logits = model(vx)
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
         loss = nn.functional.cross_entropy(
-            logits.view(-1, 256),
-            vy.view(-1),
-            reduction="sum",
+            logits.view(-1, logits.size(-1)), y.view(-1), reduction="sum"
         )
         nats_sum += loss.item()
-        tok_count += vy.numel()
+        tok_sum += y.numel()
     model.train()
-    return (nats_sum / tok_count) / LN2
+    return (nats_sum / tok_sum) / LN2
 
+# ───────────────────────── datasets ────────────────────────
+class ByteDataset(Dataset):
+    def __init__(self, path: str, seq_len: int):
+        data = pathlib.Path(path).read_bytes()
+        self.data = torch.tensor(list(data), dtype=torch.long)
+        self.seq_len = seq_len
 
-# ───────────────────────── main ────────────────────────────────
+    def __len__(self):
+        return 10_000_000  # virtual
+
+    def __getitem__(self, _):
+        start = torch.randint(0, len(self.data) - self.seq_len - 1, ()).item()
+        x = self.data[start:start + self.seq_len]
+        y = self.data[start + 1:start + 1 + self.seq_len]
+        return x, y
+
+class SeqByteDataset(Dataset):
+    def __init__(self, path: str, seq_len: int):
+        data = pathlib.Path(path).read_bytes()
+        self.data = torch.tensor(list(data), dtype=torch.long)
+        self.seq_len = seq_len
+
+    def __len__(self):
+        return (len(self.data) - 1) // self.seq_len
+
+    def __getitem__(self, idx):
+        s = idx * self.seq_len
+        x = self.data[s:s + self.seq_len]
+        y = self.data[s + 1:s + 1 + self.seq_len]
+        return x, y
+
+# ───────────────────────── main ────────────────────────────
 def main():
-    p = argparse.ArgumentParser()
-    # embedding options
-    p.add_argument("--use_phase", action="store_true",
-                   help="enable rotary φ-phase in DSN embedding")
-    p.add_argument("--max_seq_len", type=int, default=256,
-                   help="max sequence length for rotary schedule")
-    p.add_argument("--dynamic_depth", action="store_true",
-                   help="enable dynamic per-token depth gating")
-    # block options
-    p.add_argument("--p_depth", type=float, default=0.0,
-                   help="depth-channel dropout probability")
-    # entropy sampling
-    p.add_argument("--entropy_idx", type=str,
-                   help=".npz index for entropy sampling")
-    p.add_argument("--low_pct", type=float, default=0.33)
-    p.add_argument("--high_pct", type=float, default=0.33)
+    parser = argparse.ArgumentParser()
+    # curriculum & epochs
+    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--steps_per_epoch", type=int, default=4000)
+    # EMA
+    parser.add_argument("--ema", type=float, default=0.0,
+                        help="EMA decay (0 disables)")
+    parser.add_argument("--ema_start", type=int, default=5000,
+                        help="first step when EMA is used for validation")
+    # LR schedule
+    parser.add_argument("--lr_schedule", choices=["constant", "cosine"],
+                        default="constant", help="LR schedule to use")
+    parser.add_argument("--min_lr", type=float, default=1e-5,
+                        help="minimum LR for cosine schedule")
+    # embedding / model
+    parser.add_argument("--use_phase", action="store_true")
+    parser.add_argument("--dynamic_depth", action="store_true")
+    parser.add_argument("--max_seq_len", type=int, default=256)
+    parser.add_argument("--p_depth", type=float, default=0.0)
+    # data paths
+    parser.add_argument("--data", required=True)
+    parser.add_argument("--entropy_idx")
+    parser.add_argument("--val")
+    # training hyper-params
+    parser.add_argument("--bs", type=int, default=64)
+    parser.add_argument("--seq", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--dmodel", type=int, default=128)
+    parser.add_argument("--depth", type=int, default=8)
+    parser.add_argument("--omega", type=int, default=64)
     # validation / early-stop
-    p.add_argument("--val", type=str,
-                   help="hold-out .bin file for validation")
-    p.add_argument("--eval_every", type=int, default=500,
-                   help="steps between validation passes")
-    p.add_argument("--max_val_batches", type=int, default=100,
-                   help="batches evaluated per validation run")
-    p.add_argument("--patience", type=int, default=3,
-                   help="early-stop patience (val BPB)")
-    # basic training args
-    p.add_argument("--data",   type=str, required=True,
-                   help="raw .bin training file")
-    p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--bs",     type=int, default=64)
-    p.add_argument("--seq",    type=int, default=512)
-    p.add_argument("--lr",     type=float, default=1e-3)
-    p.add_argument("--dmodel", type=int, default=128)
-    p.add_argument("--depth",  type=int, default=8)
-    p.add_argument("--omega",  type=int, default=64)
-    args = p.parse_args()
+    parser.add_argument("--eval_every", type=int, default=1000)
+    parser.add_argument("--max_val_batches", type=int, default=100)
+    parser.add_argument("--patience", type=int, default=3)
 
+    args = parser.parse_args()
     device = select_device()
 
     # ───────── training dataset ─────────
-    if args.entropy_idx and EntropyBandedDataset is not None:
-        ds = EntropyBandedDataset(
-            bin_path=args.data,
-            idx_path=args.entropy_idx,
-            seq_len=args.seq,
-            low_pct=args.low_pct,
-            high_pct=args.high_pct,
-        )
-        print(f"🔍 Entropy-band sampling: low={args.low_pct}, high={args.high_pct}")
+    if args.entropy_idx:
+        train_ds = AdaptiveEntropySampler(args.data, args.entropy_idx, args.seq)
+        print("🔄  Adaptive Entropy Scheduling enabled")
     else:
-        ds = ByteDataset(args.data, args.seq)
-        if args.entropy_idx:
-            print("⚠️  Entropy index provided but class unavailable; using ByteDataset.")
+        train_ds = ByteDataset(args.data, args.seq)
+    train_loader = DataLoader(train_ds, batch_size=args.bs, pin_memory=True)
 
-    loader = DataLoader(ds, batch_size=args.bs, pin_memory=True)
-
-    # ───────── validation dataset ─────────
-    val_loader: Optional[DataLoader] = None
-    best_val = float("inf")
+    # ───────── validation loaders ──────
+    val_loader = None
+    val_low_loader = val_mid_loader = val_high_loader = None
     if args.val:
         val_loader = DataLoader(
             SeqByteDataset(args.val, args.seq),
-            batch_size=args.bs,
-            shuffle=False,
-            pin_memory=True,
+            batch_size=args.bs, shuffle=False, pin_memory=True
         )
         from train.callbacks import EarlyStop
         stopper = EarlyStop(patience=args.patience)
-        print("🧪 Validation enabled")
+        print("🧪  Validation enabled")
 
-    # ───────── model & optimiser ─────────
+        if args.entropy_idx:
+            offsets, bands, _ = load_entropy_index(args.entropy_idx)
+            idxs = (offsets // args.seq).astype(int)
+            val_ds = SeqByteDataset(args.val, args.seq)
+            max_idx = len(val_ds)
+
+            # build per-band index lists, filtering out-of-range
+            band_idxs = {}
+            for b in (0, 1, 2):
+                raw = [i for i, bb in zip(idxs, bands) if bb == b]
+                band_idxs[b] = [i for i in raw if 0 <= i < max_idx]
+
+            val_low_loader = DataLoader(
+                val_ds, batch_size=args.bs,
+                sampler=SubsetRandomSampler(band_idxs[0]),
+                pin_memory=True,
+            )
+            val_mid_loader = DataLoader(
+                val_ds, batch_size=args.bs,
+                sampler=SubsetRandomSampler(band_idxs[1]),
+                pin_memory=True,
+            )
+            val_high_loader = DataLoader(
+                val_ds, batch_size=args.bs,
+                sampler=SubsetRandomSampler(band_idxs[2]),
+                pin_memory=True,
+            )
+            print(f"🔍  Per-band val sizes: "
+                  f"low={len(band_idxs[0])}, "
+                  f"mid={len(band_idxs[1])}, "
+                  f"high={len(band_idxs[2])}")
+
+    # ───────── model & optimizer ──────
     from spectral_gpt.model import QuectoCore
     model = QuectoCore(
         d_model=args.dmodel,
@@ -201,61 +201,100 @@ def main():
         p_depth=args.p_depth,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    # ───────── training loop ─────────
-    tokens_seen, t0, step = 0, time.time(), 0
+    # ───────── LR scheduler ───────────
+    total_steps = args.epochs * args.steps_per_epoch
+    if args.lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optim, T_max=total_steps, eta_min=args.min_lr
+        )
+        print(f"🔄  Using cosine LR: start={args.lr:.1e}, "
+              f"min={args.min_lr:.1e}, steps={total_steps}")
+    else:
+        scheduler = None
+
+    # ───────── EMA shadow model ───────
+    ema = EMA(model, args.ema) if args.ema > 0.0 else None
+    if ema:
+        ema_model = deepcopy(model).eval().requires_grad_(False)
+        print(f"🌀  EMA enabled (decay={args.ema}, start={args.ema_start})")
+
+    # ───────── training loop ───────────
+    data_iter = itertools.cycle(train_loader)
+    global_step, best_val = 0, float("inf")
+    tokens_seen, t0 = 0, time.time()
+
     for epoch in range(args.epochs):
-        for x, y in loader:
-            step += 1
+        if isinstance(train_ds, AdaptiveEntropySampler):
+            train_ds.set_epoch(epoch)
+            print(f"📊  AES schedule epoch {epoch}: {train_ds.weights}")
+
+        for _ in range(args.steps_per_epoch):
+            global_step += 1
+            x, y = next(data_iter)
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
             logits = model(x)
             loss = nn.functional.cross_entropy(
-                logits.view(-1, 256),
-                y.view(-1),
+                logits.view(-1, logits.size(-1)), y.view(-1)
             )
 
-            optimizer.zero_grad(set_to_none=True)
+            optim.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            optim.step()
+
+            if scheduler:
+                scheduler.step()
+            if ema:
+                ema.update(model)
 
             tokens_seen += x.numel()
 
-            # training log
-            if step % 100 == 0:
-                elapsed = max(time.time() - t0, 1e-6)
-                tps = tokens_seen / elapsed
-                print(f"EP{epoch}-STEP{step:<6} "
+            # ─── training log ───
+            if global_step % 100 == 0:
+                tok_per_s = tokens_seen / max(time.time() - t0, 1e-6)
+                lr = scheduler.get_last_lr()[0] if scheduler else args.lr
+                print(f"EP{epoch}-STP{global_step:<6} "
                       f"loss={loss.item():.4f}  "
                       f"bpb={bpb(loss):.2f}  "
-                      f"tok/s={tps:,.0f}  "
-                      f"dev={device}")
+                      f"lr={lr:.1e}  "
+                      f"tok/s={tok_per_s:,.0f}")
+                tokens_seen, t0 = 0, time.time()
 
-            # validation pass
-            if val_loader and step % args.eval_every == 0:
-                val_bpb = run_validation(
-                    model, val_loader, device, args.max_val_batches
-                )
-                print(f"🧪  step {step}: val_bpb={val_bpb:.4f}")
+            # ─── validation ───
+            if val_loader and global_step % args.eval_every == 0:
+                use_ema = ema and global_step >= args.ema_start
+                target = ema_model if use_ema else model
+                if use_ema and global_step == args.ema_start:
+                    print(f"ℹ️  EMA validation begins at step {global_step}")
 
-                if val_bpb < best_val:
-                    best_val = val_bpb
-                    save_ckpt(model, step, pathlib.Path("chkpts"), tag="best")
-                    print("⭐  new best model saved")
+                val_b = eval_bpb(target, val_loader, device, args.max_val_batches)
+                print(f"🧪  step {global_step}: val_bpb={val_b:.4f}")
+
+                if val_low_loader:
+                    b0 = eval_bpb(target, val_low_loader, device, args.max_val_batches)
+                    b1 = eval_bpb(target, val_mid_loader, device, args.max_val_batches)
+                    b2 = eval_bpb(target, val_high_loader, device, args.max_val_batches)
+                    print(f"        band0={b0:.4f}  band1={b1:.4f}  band2={b2:.4f}")
+
+                if val_b < best_val:
+                    best_val = val_b
+                    save_ckpt(model, global_step, tag="best")
+                    print("⭐  new best saved")
                 else:
+                    from train.callbacks import EarlyStop
                     if stopper(best_val):  # type: ignore
-                        print("⏹️  early stopping triggered")
+                        print("⏹️  early stopping")
+                        save_ckpt(model, global_step, tag="final")
                         return
 
-            # periodic checkpoint if no validation
-            if not val_loader and step % 500 == 0:
-                save_ckpt(model, step, pathlib.Path("chkpts"))
+        # end of epoch checkpoint
+        save_ckpt(model, global_step)
 
-    # final save
-    save_ckpt(model, step, pathlib.Path("chkpts"), tag="final")
-    print("🏁 Training complete")
+    save_ckpt(model, global_step, tag="final")
+    print("🏁  Training complete")
 
 
 if __name__ == "__main__":
