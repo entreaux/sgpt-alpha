@@ -1,61 +1,129 @@
+# ── src/spectral_gpt/layers/fsp_ffn.py ─────────────────────────────────────────
+"""
+Fractional‑Spectral Projection Feed‑Forward Network (FSP‑FFN)
+Hardened v0.2.1 – MPS‑safe
+
+Changes vs v0.2
+---------------
+* **Conditional spectral‑norm** – `torch.nn.utils.parametrizations.spectral_norm`
+  is applied only when the current backend supports `torch.vdot`
+  (CUDA & CPU); on M‑series GPUs we silently skip SN to avoid the
+  `NotImplementedError`.
+* Keeps all previous numerical‑stability upgrades (safe init, clamps, LN).
+
+Set the environment variable `SGPT_SN_FORCE=1` if you still want SN on an
+MPS run (requires `PYTORCH_ENABLE_MPS_FALLBACK=1`, which runs the power
+iteration on CPU and is ≈5–10 % slower).
+"""
+
+from __future__ import annotations
+
+import math
+import os
 import torch
 import torch.nn as nn
-from torch.special import gamma
+import torch.nn.functional as F
+
+# -----------------------------------------------------------------------------
+# Helper: detect whether the backend can run spectral_norm without hitting
+# aten::vdot issues (MPS as of PyTorch 2.3 cannot).
+# -----------------------------------------------------------------------------
+
+def _spectral_norm_supported() -> bool:
+    """Return True if the active backend implements torch.vdot."""
+    if os.getenv("SGPT_SN_FORCE", "0") == "1":
+        return True  # caller forces SN regardless of backend
+    return not torch.backends.mps.is_available()
+
+
+# -----------------------------------------------------------------------------
+# Main module
+# -----------------------------------------------------------------------------
 
 class FSPFFN(nn.Module):
-    """
-    Fractional Spectral Projection Feed-Forward Network (FSP-FFN).
+    r"""
+    Fractional–Spectral Projection FFN
 
-    Args:
-        d_model (int): hidden dimension
-        r (int): low-rank projection dimension (<< d_model)
-        omega_min (float): minimum fractional exponent
-        omega_max (float): maximum fractional exponent
+        x ∈ ℝ^{B×L×d}
+          —P→ u  ∈ ℝ^{B×L×r}          (learnable low‑rank projection)
+          —ϕ→ z  ∈ ℝ^{B×L×r}          (fractional power per‑rank ω_j)
+          —LN→                          (rank‑wise variance control)
+          —Q→ y  ∈ ℝ^{B×L×d}          (reconstruction)
+
+    Forward maths (per element):
+        u  = x P
+        z  = exp( ω · ln|u| − lnΓ(ω+1) ) * sign(u) * A
+        y  = Q( LayerNorm(z) )
+
+    Parameters
+    ----------
+    d_model : int
+        Model hidden size.
+    r : int
+        Low‑rank bottleneck size.
+    omega_min, omega_max : float
+        Range clamp for fractional exponent ω.
+    eps : float
+        Clamp for log safety.
+    spectral_norm : bool
+        Whether to wrap P and Q with 1‑Lipschitz spectral normalisation
+        **when supported by the backend**.
     """
-    def __init__(self, d_model: int, r: int, omega_min: float = 0.5, omega_max: float = 3.0):
+
+    def __init__(
+        self,
+        d_model: int,
+        r: int,
+        *,
+        omega_min: float = 0.3,
+        omega_max: float = 1.7,
+        eps: float = 1e-6,
+        spectral_norm: bool = True,
+    ) -> None:
         super().__init__()
-        self.d_model = d_model
         self.r = r
-        self.omega_min = omega_min
-        self.omega_max = omega_max
+        self.eps = eps
+        self.register_buffer("_omega_min", torch.tensor(omega_min))
+        self.register_buffer("_omega_max", torch.tensor(omega_max))
 
-        # Low-rank projections P: d_model -> r, Q: r -> d_model
-        self.P = nn.Linear(d_model, r, bias=False)
-        self.Q = nn.Linear(r, d_model, bias=False)
+        # ---------------- low‑rank projections ----------------
+        self.P = nn.Linear(d_model, r,  bias=True)
+        self.Q = nn.Linear(r,       d_model, bias=False)
 
-        # Spectral kernel parameters: A_j and alpha_j per kernel
-        # A: (r, r) where row j is A_j
-        self.A = nn.Parameter(torch.randn(r, r))
-        # alpha: (r,) scalar mixing weights
-        self.alpha = nn.Parameter(torch.ones(r))
+        if spectral_norm and _spectral_norm_supported():
+            self.P = nn.utils.parametrizations.spectral_norm(self.P)
+            self.Q = nn.utils.parametrizations.spectral_norm(self.Q)
 
-        # Fractional exponents omega_j
-        self.omega = nn.Parameter(
-            torch.rand(r) * (omega_max - omega_min) + omega_min
-        )
+        # ---------------- learnable spectral params -----------
+        # Initialise ω around 1.0 inside the [min,max] range
+        init_frac = (1.0 - omega_min) / (omega_max - omega_min)
+        init_raw  = math.log(init_frac) - math.log1p(-init_frac)  # logit
+        self._raw_omega = nn.Parameter(torch.full((r,), init_raw))
+        self.A          = nn.Parameter(torch.ones(r) / r)
 
-        # Output bias
-        self.bias = nn.Parameter(torch.zeros(d_model))
+        # Normalisation over the rank dimension
+        self.ln = nn.LayerNorm(r)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, L, d_model)
-        U = self.P(x)  # (B, L, r)
+    # ------------------------------------------------------------------ utils
+    def _omega(self) -> torch.Tensor:
+        """Sigmoid‑map raw parameter → [omega_min, omega_max]."""
+        sig = torch.sigmoid(self._raw_omega)
+        return self._omega_min + (self._omega_max - self._omega_min) * sig
 
-        # Compute Gamma(omega_j + 1) for normalization: shape (1,1,r)
-        gamma_vals = gamma(self.omega + 1).view(1, 1, -1)
+    # ------------------------------------------------------------------ fwd
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B,L,d)
+        u = self.P(x)                                    # (B,L,r)
+        ω = self._omega()                                # (r,)
 
-        # Fractional spectral expansion: V_j = U**omega_j / Gamma(omega_j+1)
-        V = U.pow(self.omega.view(1, 1, -1)) / gamma_vals  # (B, L, r)
+        # Fractional power in log‑space
+        sign_u   = torch.sign(u)
+        log_safe = torch.clamp(u.abs(), min=self.eps).log()
+        log_gamma = torch.lgamma(ω + 1.0)                # (r,)
 
-        # Prepare for mixing: expand dims
-        V_exp = V.unsqueeze(-1)                 # (B, L, r, 1)
-        A_exp = self.A.unsqueeze(0).unsqueeze(0) # (1, 1, r, r)
-        alpha_exp = self.alpha.view(1, 1, -1, 1) # (1, 1, r, 1)
+        # Broadcast ω and lnΓ over (B,L)
+        ω_b, lg_b = ω.view(1, 1, -1), log_gamma.view(1, 1, -1)
+        z = torch.exp(ω_b * log_safe - lg_b) * sign_u    # (B,L,r)
+        z = z * self.A                                   # amplitude gate
 
-        # Z: mix across r kernels → (B, L, r)
-        Z = (V_exp * A_exp * alpha_exp).sum(dim=2)
-
-        # Reconstruct to d_model and add bias
-        y = self.Q(Z) + self.bias  # (B, L, d_model)
-        return y
-
+        z = self.ln(z)
+        return self.Q(z)                                 # (B,L,d)

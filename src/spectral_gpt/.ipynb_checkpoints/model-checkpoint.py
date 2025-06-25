@@ -1,68 +1,52 @@
 import torch
 import torch.nn as nn
-from spectral_gpt.layers.dsn_embedding import DSNEmbedding
 from spectral_gpt.block import SpectralBlock
+from spectral_gpt.layers.shared_proj import SharedProj
 
 class QuectoCore(nn.Module):
     """
-    Spectral‑GPT core:
-    * DSN embedding with optional φ‑rotary phase
-    * Optional dynamic per‑token depth gating
-    * Depth‑dropout inside each SpectralBlock
-
-    Args:
-        d_model (int): hidden size
-        n_heads (int): attention heads
-        depth (int): number of SpectralBlocks
-        Ω (int): DSN depth channels
-        use_phase (bool): enable φ‑rotary
-        max_seq_len (int): L_max for phase schedule
-        dynamic_depth (bool): enable gating MLP in DSN
-        p_depth (float): dropout prob on depth channels (0‒1)
+    SGPT v3 core: threads step and layer_idx through each block.
     """
     def __init__(
         self,
-        d_model: int = 32,
-        n_heads: int = 4,
-        depth: int = 2,
-        Ω: int = 8,
-        use_phase: bool = False,
-        max_seq_len: int = 512,
-        dynamic_depth: bool = False,
-        p_depth: float = 0.0,
+        vocab_size: int,
+        d_model: int,
+        depth: int,
+        max_seq_len: int,
+        fsp_rank: int,
+        attn_type: str,
+        sia_r: int,
     ):
         super().__init__()
-        self.Ω = Ω
-        self.use_phase = use_phase
-        self.dynamic_depth = dynamic_depth
-
-        # DSN embedding layer
-        self.embed = DSNEmbedding(
-            max_depth=Ω,
-            use_phase=use_phase,
-            max_seq_len=max_seq_len,
-            dynamic_depth=dynamic_depth,
-        )
-        in_channels = Ω * (2 if use_phase else 1)
-
-        # Projection Ω(or 2Ω) → d_model
-        self.proj = nn.Linear(in_channels, d_model)
-
-        # Stacked SpectralBlocks
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        self.shared = SharedProj(d_model, sia_r)
         self.blocks = nn.ModuleList([
-            SpectralBlock(d_model=d_model, n_heads=n_heads, p_depth=p_depth)
+            SpectralBlock(
+                d_model=d_model,
+                fsp_rank=fsp_rank,
+                attn_type=attn_type,
+                sia_r=sia_r,
+                shared=self.shared,
+            )
             for _ in range(depth)
         ])
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
 
-        self.norm = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, 256, bias=False)
+    def forward(self, idx: torch.LongTensor, step: int = 0) -> torch.Tensor:
+        B, L = idx.shape
+        device = idx.device
 
-    # ---------------------------------------------------------
-    def forward(self, x: torch.LongTensor) -> torch.Tensor:
-        # x: (B, L)
-        x = self.embed(x)   # (B, L, Ω or 2Ω)
-        x = self.proj(x)    # (B, L, d_model)
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.norm(x)
-        return self.head(x) # (B, L, 256)
+        tok = self.tok_emb(idx)  # (B,L,d_model)
+        pos = self.pos_emb(
+            torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
+        )
+        x = tok + pos
+
+        # pass step and layer index into each block
+        for layer_idx, blk in enumerate(self.blocks):
+            x = blk(x, step=step, layer_idx=layer_idx)
+
+        x = self.ln_f(x)
+        return self.head(x)

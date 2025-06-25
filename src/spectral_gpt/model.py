@@ -1,57 +1,52 @@
 import torch
 import torch.nn as nn
-from spectral_gpt.layers.dsn_embedding import DSNEmbedding
-from spectral_gpt.layers.block import SpectralBlock
+from spectral_gpt.block import SpectralBlock
+from spectral_gpt.layers.shared_proj import SharedProj
 
 class QuectoCore(nn.Module):
     """
-    Spectral‑GPT core with optional FSP-FFN.
+    SGPT v3 core: threads step and layer_idx through each block.
     """
     def __init__(
         self,
-        d_model: int = 128,
-        n_heads: int = 8,
-        depth: int = 8,
-        Ω: int = 64,
-        use_phase: bool = False,
-        max_seq_len: int = 512,
-        dynamic_depth: bool = False,
-        p_depth: float = 0.0,
-        use_fsp_ffn: bool = False,
-        fsp_rank: int = None,
-        omega_min: float = 0.5,
-        omega_max: float = 3.0,
+        vocab_size: int,
+        d_model: int,
+        depth: int,
+        max_seq_len: int,
+        fsp_rank: int,
+        attn_type: str,
+        sia_r: int,
     ):
         super().__init__()
-        self.embed = DSNEmbedding(
-            max_depth=Ω,
-            use_phase=use_phase,
-            max_seq_len=max_seq_len,
-            dynamic_depth=dynamic_depth,
-        )
-        in_channels = Ω * (2 if use_phase else 1)
-        self.proj = nn.Linear(in_channels, d_model)
-
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        self.shared = SharedProj(d_model, sia_r)
         self.blocks = nn.ModuleList([
             SpectralBlock(
                 d_model=d_model,
-                n_heads=n_heads,
-                p_depth=p_depth,
-                use_fsp_ffn=use_fsp_ffn,
                 fsp_rank=fsp_rank,
-                omega_min=omega_min,
-                omega_max=omega_max,
-            ) for _ in range(depth)
+                attn_type=attn_type,
+                sia_r=sia_r,
+                shared=self.shared,
+            )
+            for _ in range(depth)
         ])
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
 
-        self.norm = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, 256, bias=False)
+    def forward(self, idx: torch.LongTensor, step: int = 0) -> torch.Tensor:
+        B, L = idx.shape
+        device = idx.device
 
-    def forward(self, x: torch.LongTensor) -> torch.Tensor:
-        x = self.embed(x)
-        x = self.proj(x)
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.norm(x)
+        tok = self.tok_emb(idx)  # (B,L,d_model)
+        pos = self.pos_emb(
+            torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
+        )
+        x = tok + pos
+
+        # pass step and layer index into each block
+        for layer_idx, blk in enumerate(self.blocks):
+            x = blk(x, step=step, layer_idx=layer_idx)
+
+        x = self.ln_f(x)
         return self.head(x)
-
